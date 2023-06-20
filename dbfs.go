@@ -182,8 +182,6 @@ func (fs *FS) namei(fname string) (int, error) {
 }
 
 func (fs *FS) Open(fname string) (fs.File, error) {
-	fmt.Println("calling open")
-	defer fmt.Println("calling open: return")
 	if !path.IsAbs(fname) {
 		return nil, fmt.Errorf("relative path are not supported")
 	}
@@ -213,8 +211,6 @@ type File struct {
 }
 
 func (f *File) Read(out []byte) (int, error) {
-	fmt.Println("calling read")
-	defer fmt.Println("calling read: return")
 	if f.closed {
 		return 0, fmt.Errorf("file closed")
 	}
@@ -228,7 +224,6 @@ func (f *File) Read(out []byte) (int, error) {
 		return b
 	}(f.size-f.offset, int64(len(out)))
 
-	// XXX the query is incorrect
 	rows, err := f.db.NamedQuery(`
 		WITH offsets AS (
 			SELECT
@@ -285,8 +280,6 @@ func (f *File) Read(out []byte) (int, error) {
 }
 
 func (f *File) Close() error {
-	fmt.Println("calling close")
-	defer fmt.Println("calling close: return")
 	f.db = nil
 	f.closed = true
 	return nil
