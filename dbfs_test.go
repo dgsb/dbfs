@@ -49,4 +49,8 @@ func Test_AddFile(t *testing.T) {
 
 	err = sqlitefs.UpsertFile("/poésie/lamartine/le_lac", 32, []byte(leLac))
 	require.NoError(t, err)
+
+	check, err = fs.ReadFile(sqlitefs, "/poésie/lamartine/le_lac")
+	require.NoError(t, err)
+	require.Equal(t, leLac, string(check))
 }

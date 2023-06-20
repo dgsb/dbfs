@@ -244,7 +244,7 @@ func (f *File) Read(out []byte) (int, error) {
 			data,
 			size,
 			start
-		FROM github_dgsb_dbfs_chunks JOIN offsets
+		FROM github_dgsb_dbfs_chunks JOIN offsets USING (position)
 		WHERE inode = :inode
 			AND :offset < start + size
 			AND :offset + :size >= start
