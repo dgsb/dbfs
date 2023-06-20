@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/jmoiron/sqlx"
@@ -204,6 +205,7 @@ func (fs *FS) Open(fname string) (fs.File, error) {
 
 type File struct {
 	db     *sqlx.DB
+	name   string
 	inode  int
 	offset int64
 	size   int64
@@ -286,7 +288,37 @@ func (f *File) Close() error {
 }
 
 func (f *File) Stat() (fs.FileInfo, error) {
-	fmt.Println("calling stat")
-	defer fmt.Println("calling stat: return")
-	return nil, fmt.Errorf("not yet implemented")
+	return FileInfo{
+		name: f.name,
+		size: f.size,
+	}, nil
+}
+
+type FileInfo struct {
+	name string
+	size int64
+}
+
+func (fi FileInfo) Name() string {
+	return path.Base(fi.name)
+}
+
+func (fi FileInfo) Size() int64 {
+	return fi.size
+}
+
+func (fi FileInfo) Mode() fs.FileMode {
+	return 0444
+}
+
+func (fi FileInfo) ModTime() time.Time {
+	return time.Unix(0, 0)
+}
+
+func (fi FileInfo) IsDir() bool {
+	return false
+}
+
+func (fi FileInfo) Sys() any {
+	return nil
 }
