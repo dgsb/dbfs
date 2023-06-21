@@ -22,7 +22,7 @@ type FS struct {
 }
 
 var (
-	RelativePathErr  = fmt.Errorf("relative path are not supported")
+	InvalidPathErr   = fmt.Errorf("invalid path")
 	InodeNotFoundErr = fmt.Errorf("cannot find inode")
 	IncorrectTypeErr = fmt.Errorf("incorrect file type")
 )
@@ -57,17 +57,13 @@ func NewSqliteFS(dbName string) (*FS, error) {
 	return fs, nil
 }
 
-func (fs *FS) Close() error {
-	return fs.db.Close()
+func (f *FS) Close() error {
+	return f.db.Close()
 }
 
-func (fs *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
-	if !path.IsAbs(fname) {
-		return 0, fmt.Errorf("%w: %s", RelativePathErr, fname)
-	}
-
-	components := strings.Split(fname, "/")[1:]
-	var parentInode = fs.rootInode
+func (f *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
+	components := strings.Split(fname, "/")
+	var parentInode = f.rootInode
 	for i, searchMode := 0, true; i < len(components); i++ {
 		if searchMode {
 			var (
@@ -113,8 +109,8 @@ func (fs *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
 }
 
 func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
-	if !path.IsAbs(fname) {
-		return fmt.Errorf("%w: %s", RelativePathErr, fname)
+	if path.IsAbs(fname) {
+		return fmt.Errorf("%w: %s", InvalidPathErr, fname)
 	}
 	fname = path.Clean(fname)
 
@@ -157,42 +153,52 @@ func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
 	return nil
 }
 
-func (fs *FS) namei(fname string) (int, error) {
-	if !path.IsAbs(fname) {
-		return 0, fmt.Errorf("%w: %s", RelativePathErr, fname)
+func (fs *FS) namei(fname string) (int, string, error) {
+	if path.IsAbs(fname) {
+		return 0, "", fmt.Errorf("%w: %s", InvalidPathErr, fname)
 	}
-	components := strings.Split(fname, "/")[1:]
-	if len(components) == 0 {
-		return fs.rootInode, nil
+	if fname == "." {
+		return fs.rootInode, DirectoryType, nil
 	}
+	components := strings.Split(fname, "/")
 
-	var inode int
+	var (
+		inode int
+		ftype string
+	)
 	for i, parentInode := 0, fs.rootInode; i < len(components); i, parentInode = i+1, inode {
 		row := fs.db.QueryRow(
-			"SELECT inode FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?",
+			"SELECT inode, type FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?",
 			parentInode, components[i])
-		if err := row.Scan(&inode); errors.Is(err, sql.ErrNoRows) {
-			return 0, fmt.Errorf(
+		if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
+			return 0, "", fmt.Errorf(
 				"%w: parent inode %d, fname %s", InodeNotFoundErr, parentInode, components[i])
 		} else if err != nil {
-			return 0, fmt.Errorf(
+			return 0, "", fmt.Errorf(
 				"querying file table: inode %d, fname %s, %w", parentInode, components[i], err)
 		}
 	}
-	return inode, nil
+	return inode, ftype, nil
 }
 
-func (fs *FS) Open(fname string) (fs.File, error) {
-	if !path.IsAbs(fname) {
-		return nil, fmt.Errorf("relative path are not supported")
-	}
+func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 
-	f := &File{db: fs.db}
-	inode, err := fs.namei(fname)
+	if !fs.ValidPath(fname) {
+		return nil, fmt.Errorf("path to open is invalid: %s", fname)
+	}
+	f := &File{db: fsys.db, name: fname}
+
+	if strings.HasPrefix(fname, "./") {
+		fname, _ = strings.CutPrefix(fname, ".")
+	}
+	fname = path.Clean(fname)
+
+	inode, ftype, err := fsys.namei(fname)
 	if err != nil {
 		return nil, fmt.Errorf("namei on %s: %w", fname, err)
 	}
 	f.inode = inode
+	f.ftype = ftype
 
 	row := f.db.QueryRowx(
 		"SELECT COALESCE(sum(size), 0) FROM github_dgsb_dbfs_chunks WHERE inode = ?", f.inode)
@@ -205,14 +211,19 @@ func (fs *FS) Open(fname string) (fs.File, error) {
 
 type File struct {
 	db     *sqlx.DB
+	ftype  string
 	name   string
 	inode  int
 	offset int64
 	size   int64
 	closed bool
+	eof    bool
 }
 
 func (f *File) Read(out []byte) (int, error) {
+	if f.ftype != RegularFileType {
+		return 0, fmt.Errorf("%w: %s", IncorrectTypeErr, f.ftype)
+	}
 	if f.closed {
 		return 0, fmt.Errorf("file closed")
 	}
@@ -289,14 +300,75 @@ func (f *File) Close() error {
 
 func (f *File) Stat() (fs.FileInfo, error) {
 	return FileInfo{
-		name: f.name,
-		size: f.size,
+		name:  f.name,
+		size:  f.size,
+		ftype: f.ftype,
 	}, nil
 }
 
+func (f *File) ReadDir(n int) ([]fs.DirEntry, error) {
+	if f.ftype != DirectoryType {
+		return []fs.DirEntry{}, fmt.Errorf("%w: %s", IncorrectTypeErr, f.ftype)
+	}
+	if f.eof {
+		if n > 0 {
+			return []fs.DirEntry{}, io.EOF
+		}
+		return []fs.DirEntry{}, nil
+	}
+	query := `
+		SELECT
+			github_dgsb_dbfs_files.inode,
+			fname,
+			type,
+			SUM(COALESCE(size, 0)) size
+		FROM github_dgsb_dbfs_files LEFT JOIN github_dgsb_dbfs_chunks USING (inode)
+		WHERE parent = ? AND inode > ?
+		GROUP BY github_dgsb_dbfs_files.inode, fname, type
+		ORDER BY inode`
+	if n > 0 {
+		query += fmt.Sprintf(` LIMIT %d`, n)
+	}
+	rows, err := f.db.Queryx(query, f.inode, f.offset)
+	if err != nil {
+		return []fs.DirEntry{}, fmt.Errorf("cannot not query file table: %w", err)
+	}
+	defer rows.Close()
+
+	files := []File{}
+	for rows.Next() {
+		var entry File
+
+		if err := rows.Scan(&entry.inode, &entry.name, &entry.ftype, &entry.size); err != nil {
+			return []fs.DirEntry{}, fmt.Errorf("cannot scan database row: %w", err)
+		}
+		files = append(files, entry)
+		f.offset = int64(entry.inode)
+	}
+	if err := rows.Err(); err != nil {
+		return []fs.DirEntry{}, fmt.Errorf("cannot browse file table: %w", err)
+	}
+
+	entries := make([]fs.DirEntry, 0, len(files))
+	for _, v := range files {
+		if fi, err := v.Stat(); err != nil {
+			return []fs.DirEntry{}, fmt.Errorf("cannot stat file with inode %d: %w", v.inode, err)
+		} else {
+			entries = append(entries, fs.FileInfoToDirEntry(fi))
+		}
+	}
+
+	if len(entries) == 0 {
+		f.eof = true
+	}
+
+	return entries, nil
+}
+
 type FileInfo struct {
-	name string
-	size int64
+	name  string
+	ftype string
+	size  int64
 }
 
 func (fi FileInfo) Name() string {
@@ -308,6 +380,10 @@ func (fi FileInfo) Size() int64 {
 }
 
 func (fi FileInfo) Mode() fs.FileMode {
+	if fi.ftype == DirectoryType {
+		return 0444 | fs.ModeDir
+	}
+
 	return 0444
 }
 
@@ -316,7 +392,7 @@ func (fi FileInfo) ModTime() time.Time {
 }
 
 func (fi FileInfo) IsDir() bool {
-	return false
+	return fi.ftype == DirectoryType
 }
 
 func (fi FileInfo) Sys() any {
