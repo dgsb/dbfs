@@ -25,6 +25,7 @@ var (
 	InvalidPathErr   = fmt.Errorf("invalid path")
 	InodeNotFoundErr = fmt.Errorf("cannot find inode")
 	IncorrectTypeErr = fmt.Errorf("incorrect file type")
+	DirNotEmptyErr   = fmt.Errorf("directory is not empty")
 )
 
 const (
@@ -153,7 +154,7 @@ func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
 	return nil
 }
 
-func (fs *FS) namei(fname string) (int, string, error) {
+func (fs *FS) namei(tx sqlx.Queryer, fname string) (int, string, error) {
 	if path.IsAbs(fname) {
 		return 0, "", fmt.Errorf("%w: %s", InvalidPathErr, fname)
 	}
@@ -167,7 +168,7 @@ func (fs *FS) namei(fname string) (int, string, error) {
 		ftype string
 	)
 	for i, parentInode := 0, fs.rootInode; i < len(components); i, parentInode = i+1, inode {
-		row := fs.db.QueryRow(
+		row := tx.QueryRowx(
 			"SELECT inode, type FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?",
 			parentInode, components[i])
 		if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
@@ -179,6 +180,45 @@ func (fs *FS) namei(fname string) (int, string, error) {
 		}
 	}
 	return inode, ftype, nil
+}
+
+func (fsys *FS) DeleteFile(fname string) (ret error) {
+	tx, err := fsys.db.Beginx()
+	if err != nil {
+		return fmt.Errorf("cannot start transaction: %w", err)
+	}
+	defer func() {
+		if ret == nil {
+			ret = tx.Commit()
+		} else {
+			ret = multierror.Append(ret, tx.Rollback())
+		}
+	}()
+
+	inode, _, err := fsys.namei(tx, fname)
+	if err != nil {
+		return fmt.Errorf("cannot find inode for %s: %w", fname, err)
+	}
+
+	// Check this is not a directory tree with children
+	var childCount int
+	row := tx.QueryRow("SELECT count(1) FROM github_dgsb_dbfs_files WHERE parent = ?", inode)
+	if err := row.Scan(&childCount); err != nil {
+		return fmt.Errorf("cannot count children: %w", err)
+	}
+	if childCount > 0 {
+		return fmt.Errorf("%w: %s", err, fname)
+	}
+
+	if _, err := tx.Exec("DELETE FROM github_dgsb_dbfs_chunks WHERE inode = ?", inode); err != nil {
+		return fmt.Errorf("cannot delete file chunks: %w", err)
+	}
+
+	if _, err := tx.Exec("DELETE FROM github_dgsb_dbfs_files WHERE inode = ?", inode); err != nil {
+		return fmt.Errorf("cannot delete file entry: %w", err)
+	}
+
+	return nil
 }
 
 func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
@@ -193,7 +233,7 @@ func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 	}
 	fname = path.Clean(fname)
 
-	inode, ftype, err := fsys.namei(fname)
+	inode, ftype, err := fsys.namei(fsys.db, fname)
 	if err != nil {
 		return nil, fmt.Errorf("namei on %s: %w", fname, err)
 	}
