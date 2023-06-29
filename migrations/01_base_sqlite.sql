@@ -6,8 +6,7 @@ CREATE TABLE github_dgsb_dbfs_files (
     FOREIGN KEY (parent) REFERENCES github_dgsb_dbfs_files(inode)
 );
 
-CREATE INDEX github_dgsb_dbfs_files_parent ON github_dgsb_dbfs_files(parent);
-CREATE UNIQUE INDEX github_dgsb_dbfs_files_parent_fname ON github_dgsb_dbfs_files(fname, parent);
+CREATE UNIQUE INDEX github_dgsb_dbfs_files_parent_fname ON github_dgsb_dbfs_files(parent, fname);
 
 CREATE TABLE github_dgsb_dbfs_chunks (
     inode INTEGER,

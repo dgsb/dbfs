@@ -19,6 +19,7 @@ import (
 type FS struct {
 	db        *sqlx.DB
 	rootInode int
+	nameiStmt *sqlx.Stmt
 }
 
 var (
@@ -53,6 +54,12 @@ func NewSqliteFS(dbName string) (*FS, error) {
 		WHERE fname = '/' AND parent IS NULL`)
 	if err := row.Scan(&fs.rootInode); err != nil {
 		return nil, fmt.Errorf("no root inode: %w %w", InodeNotFoundErr, err)
+	}
+
+	fs.nameiStmt, err = fs.db.Preparex(
+		"SELECT inode, type FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?")
+	if err != nil {
+		return nil, fmt.Errorf("cannot prepare namei statement: %w", err)
 	}
 
 	return fs, nil
@@ -154,7 +161,7 @@ func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
 	return nil
 }
 
-func (fs *FS) namei(tx sqlx.Queryer, fname string) (int, string, error) {
+func (fs *FS) namei(tx *sqlx.Tx, fname string) (int, string, error) {
 	if path.IsAbs(fname) {
 		return 0, "", fmt.Errorf("%w: %s", InvalidPathErr, fname)
 	}
@@ -167,10 +174,9 @@ func (fs *FS) namei(tx sqlx.Queryer, fname string) (int, string, error) {
 		inode int
 		ftype string
 	)
+	stmt := tx.Stmtx(fs.nameiStmt)
 	for i, parentInode := 0, fs.rootInode; i < len(components); i, parentInode = i+1, inode {
-		row := tx.QueryRowx(
-			"SELECT inode, type FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?",
-			parentInode, components[i])
+		row := stmt.QueryRowx(parentInode, components[i])
 		if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
 			return 0, "", fmt.Errorf(
 				"%w: parent inode %d, fname %s", InodeNotFoundErr, parentInode, components[i])
@@ -233,14 +239,20 @@ func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 	}
 	fname = path.Clean(fname)
 
-	inode, ftype, err := fsys.namei(fsys.db, fname)
+	tx, err := fsys.db.Beginx()
+	if err != nil {
+		fmt.Errorf("cannot start transaction: %w", err)
+	}
+	defer tx.Commit()
+
+	inode, ftype, err := fsys.namei(tx, fname)
 	if err != nil {
 		return nil, fmt.Errorf("namei on %s: %w", fname, err)
 	}
 	f.inode = inode
 	f.ftype = ftype
 
-	row := f.db.QueryRowx(
+	row := tx.QueryRowx(
 		"SELECT COALESCE(sum(size), 0) FROM github_dgsb_dbfs_chunks WHERE inode = ?", f.inode)
 	if err := row.Scan(&f.size); err != nil {
 		return nil, fmt.Errorf("file chunks not found: %d, %w", inode, err)
