@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"io/fs"
 	"math/rand"
+	"os"
 	"path"
 	"reflect"
 	"strings"
@@ -94,10 +95,10 @@ func TestCompliance_EmptyFS(t *testing.T) {
 
 func generatePath(rng *rand.Rand) string {
 	lexem := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123459"
-	components := make([]string, (rng.Int()%32)+1)
+	components := make([]string, (rng.Int()%17)+16)
 	for i := 0; i < len(components); i++ {
 		builder := &strings.Builder{}
-		csize := rng.Int()%16 + 1
+		csize := rng.Int()%9 + 8
 		for j := 0; j < csize; j++ {
 			builder.WriteByte(lexem[rng.Int()%len(lexem)])
 		}
@@ -227,6 +228,54 @@ func TestQuick(t *testing.T) {
 			data, err := fs.ReadFile(fsys, k)
 			require.NoError(t, err)
 			require.Equal(t, v, data)
+		}
+	})
+}
+
+func BenchmarkFS(b *testing.B) {
+	sqliteFS, err := NewSqliteFS(path.Join(b.TempDir(), "fsbench.db"))
+	require.NoError(b, err)
+	dirfsRoot := path.Join(b.TempDir(), "dirfsbenc")
+	require.NoError(b, os.MkdirAll(dirfsRoot, 0755))
+	dirFS := os.DirFS(dirfsRoot)
+
+	// generate 100 files to be used by the bench in read mode
+	files := map[string][]byte{}
+	rng := rand.New(rand.NewSource(28021976))
+	for i := 0; i < 2000; i++ {
+		var newFile string
+		for {
+			newFile = generatePath(rng)
+			if _, ok := files[newFile]; !ok { // ensure all generated path are unique
+				break
+			}
+		}
+		buf := make([]byte, rng.Int()%8192+1)
+		rng.Read(buf)
+		files[newFile] = buf
+		require.NoError(b, sqliteFS.UpsertFile(newFile, 1024, buf))
+		require.NoError(b, os.MkdirAll(path.Join(dirfsRoot, path.Dir(newFile)), 0755))
+		require.NoError(b, os.WriteFile(path.Join(dirfsRoot, newFile), buf, 0644))
+	}
+	b.ResetTimer()
+
+	b.Run("sqliteFS", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for k, v := range files {
+				data, err := fs.ReadFile(sqliteFS, k)
+				require.NoError(b, err, "cannot read file %s", k)
+				require.Equal(b, v, data)
+			}
+		}
+	})
+
+	b.Run("dirFS", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for k, v := range files {
+				data, err := fs.ReadFile(dirFS, k)
+				require.NoError(b, err, "cannot read file %s", k)
+				require.Equal(b, v, data)
+			}
 		}
 	})
 }
