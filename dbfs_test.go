@@ -253,7 +253,7 @@ func BenchmarkFS(b *testing.B) {
 		buf := make([]byte, rng.Int()%8192+1)
 		rng.Read(buf)
 		files[newFile] = buf
-		require.NoError(b, sqliteFS.UpsertFile(newFile, 1024, buf))
+		require.NoError(b, sqliteFS.UpsertFile(newFile, 8192, buf))
 		require.NoError(b, os.MkdirAll(path.Join(dirfsRoot, path.Dir(newFile)), 0755))
 		require.NoError(b, os.WriteFile(path.Join(dirfsRoot, newFile), buf, 0644))
 	}

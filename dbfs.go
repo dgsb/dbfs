@@ -17,8 +17,11 @@ import (
 )
 
 type FS struct {
-	db        *sqlx.DB
-	rootInode int
+	db             *sqlx.DB
+	rootInode      int
+	readChunksStmt *sqlx.NamedStmt
+	fileSizeStmt   *sqlx.Stmt
+	nameiStmt      *sqlx.Stmt
 }
 
 var (
@@ -53,6 +56,47 @@ func NewSqliteFS(dbName string) (*FS, error) {
 		WHERE fname = '/' AND parent IS NULL`)
 	if err := row.Scan(&fs.rootInode); err != nil {
 		return nil, fmt.Errorf("no root inode: %w %w", InodeNotFoundErr, err)
+	}
+
+	fs.readChunksStmt, err = fs.db.PrepareNamed(`
+		WITH offsets AS (
+			SELECT
+				COALESCE(
+					SUM(size) OVER (
+						ORDER BY POSITION ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+					),
+					0
+				) AS start,
+				position
+			FROM github_dgsb_dbfs_chunks
+			WHERE inode = :inode
+		)
+		SELECT
+			github_dgsb_dbfs_chunks.position,
+			data,
+			size,
+			start
+		FROM github_dgsb_dbfs_chunks JOIN offsets USING (position)
+		WHERE inode = :inode
+			AND :offset < start + size
+			AND :offset + :size >= start
+		ORDER BY github_dgsb_dbfs_chunks.position`)
+	if err != nil {
+		return nil, fmt.Errorf("cannot prepare chunk reader statement: %w", err)
+	}
+
+	fs.fileSizeStmt, err = fs.db.Preparex(
+		"SELECT COALESCE(sum(size), 0) FROM github_dgsb_dbfs_chunks WHERE inode = ?")
+	if err != nil {
+		return nil, fmt.Errorf("cannot prepare file size statement: %w", err)
+	}
+
+	fs.nameiStmt, err = fs.db.Preparex(`
+		SELECT inode, type
+		FROM github_dgsb_dbfs_files 
+		WHERE full_path = ?`)
+	if err != nil {
+		return nil, fmt.Errorf("cannot prepare namei statement: %w", err)
 	}
 
 	return fs, nil
@@ -166,10 +210,7 @@ func (fs *FS) namei(tx *sqlx.Tx, fname string) (int, string, error) {
 		ftype string
 	)
 
-	row := tx.QueryRowx(`
-		SELECT inode, type
-		FROM github_dgsb_dbfs_files 
-		WHERE full_path = ?`, fname)
+	row := tx.Stmtx(fs.nameiStmt).QueryRowx(fname)
 	if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
 		return 0, "", fmt.Errorf("%w: %s", InodeNotFoundErr, fname)
 	} else if err != nil {
@@ -223,7 +264,7 @@ func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 	if !fs.ValidPath(fname) {
 		return nil, fmt.Errorf("path to open is invalid: %s", fname)
 	}
-	f := &File{db: fsys.db, name: fname}
+	f := &File{fs: fsys, name: fname}
 
 	if strings.HasPrefix(fname, "./") {
 		fname, _ = strings.CutPrefix(fname, ".")
@@ -243,8 +284,7 @@ func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 	f.inode = inode
 	f.ftype = ftype
 
-	row := tx.QueryRowx(
-		"SELECT COALESCE(sum(size), 0) FROM github_dgsb_dbfs_chunks WHERE inode = ?", f.inode)
+	row := tx.Stmtx(fsys.fileSizeStmt).QueryRowx(f.inode)
 	if err := row.Scan(&f.size); err != nil {
 		return nil, fmt.Errorf("file chunks not found: %d, %w", inode, err)
 	}
@@ -253,7 +293,7 @@ func (fsys *FS) Open(fname string) (retFile fs.File, retError error) {
 }
 
 type File struct {
-	db     *sqlx.DB
+	fs     *FS
 	ftype  string
 	name   string
 	inode  int
@@ -280,30 +320,11 @@ func (f *File) Read(out []byte) (int, error) {
 		return b
 	}(f.size-f.offset, int64(len(out)))
 
-	rows, err := f.db.NamedQuery(`
-		WITH offsets AS (
-			SELECT
-				COALESCE(
-					SUM(size) OVER (
-						ORDER BY POSITION ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-					),
-					0
-				) AS start,
-				position
-			FROM github_dgsb_dbfs_chunks
-			WHERE inode = :inode
-		)
-		SELECT
-			github_dgsb_dbfs_chunks.position,
-			data,
-			size,
-			start
-		FROM github_dgsb_dbfs_chunks JOIN offsets USING (position)
-		WHERE inode = :inode
-			AND :offset < start + size
-			AND :offset + :size >= start
-		ORDER BY github_dgsb_dbfs_chunks.position
-		`, map[string]interface{}{"inode": f.inode, "offset": f.offset, "size": toRead})
+	rows, err := f.fs.readChunksStmt.Queryx(map[string]interface{}{
+		"inode":  f.inode,
+		"offset": f.offset,
+		"size":   toRead,
+	})
 	if err != nil {
 		return 0, fmt.Errorf("cannot query the database: %w", err)
 	}
@@ -336,7 +357,7 @@ func (f *File) Read(out []byte) (int, error) {
 }
 
 func (f *File) Close() error {
-	f.db = nil
+	f.fs = nil
 	f.closed = true
 	return nil
 }
@@ -372,7 +393,7 @@ func (f *File) ReadDir(n int) ([]fs.DirEntry, error) {
 	if n > 0 {
 		query += fmt.Sprintf(` LIMIT %d`, n)
 	}
-	rows, err := f.db.Queryx(query, f.inode, f.offset)
+	rows, err := f.fs.db.Queryx(query, f.inode, f.offset)
 	if err != nil {
 		return []fs.DirEntry{}, fmt.Errorf("cannot not query file table: %w", err)
 	}
