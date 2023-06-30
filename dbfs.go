@@ -19,7 +19,6 @@ import (
 type FS struct {
 	db        *sqlx.DB
 	rootInode int
-	nameiStmt *sqlx.Stmt
 }
 
 var (
@@ -54,12 +53,6 @@ func NewSqliteFS(dbName string) (*FS, error) {
 		WHERE fname = '/' AND parent IS NULL`)
 	if err := row.Scan(&fs.rootInode); err != nil {
 		return nil, fmt.Errorf("no root inode: %w %w", InodeNotFoundErr, err)
-	}
-
-	fs.nameiStmt, err = fs.db.Preparex(
-		"SELECT inode, type FROM github_dgsb_dbfs_files WHERE parent = ? AND fname = ?")
-	if err != nil {
-		return nil, fmt.Errorf("cannot prepare namei statement: %w", err)
 	}
 
 	return fs, nil
@@ -104,9 +97,9 @@ func (f *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
 			return RegularFileType
 		}()
 		row := tx.QueryRow(`
-			INSERT INTO github_dgsb_dbfs_files (fname, parent, type)
-			VALUES (?, ?, ?)
-			RETURNING inode`, components[i], parentInode, componentType)
+			INSERT INTO github_dgsb_dbfs_files (fname, full_path, parent, type)
+			VALUES (?, ?, ?, ?)
+			RETURNING inode`, components[i], path.Join(components[:i+1]...), parentInode, componentType)
 		if err := row.Scan(&parentInode); err != nil {
 			return 0, fmt.Errorf(
 				"cannot insert node %s as child of %d: %w", components[i], parentInode, err)
@@ -168,23 +161,21 @@ func (fs *FS) namei(tx *sqlx.Tx, fname string) (int, string, error) {
 	if fname == "." {
 		return fs.rootInode, DirectoryType, nil
 	}
-	components := strings.Split(fname, "/")
-
 	var (
 		inode int
 		ftype string
 	)
-	stmt := tx.Stmtx(fs.nameiStmt)
-	for i, parentInode := 0, fs.rootInode; i < len(components); i, parentInode = i+1, inode {
-		row := stmt.QueryRowx(parentInode, components[i])
-		if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
-			return 0, "", fmt.Errorf(
-				"%w: parent inode %d, fname %s", InodeNotFoundErr, parentInode, components[i])
-		} else if err != nil {
-			return 0, "", fmt.Errorf(
-				"querying file table: inode %d, fname %s, %w", parentInode, components[i], err)
-		}
+
+	row := tx.QueryRowx(`
+		SELECT inode, type
+		FROM github_dgsb_dbfs_files 
+		WHERE full_path = ?`, fname)
+	if err := row.Scan(&inode, &ftype); errors.Is(err, sql.ErrNoRows) {
+		return 0, "", fmt.Errorf("%w: %s", InodeNotFoundErr, fname)
+	} else if err != nil {
+		return 0, "", fmt.Errorf("querying file table: fname %s, %w", fname, err)
 	}
+
 	return inode, ftype, nil
 }
 
