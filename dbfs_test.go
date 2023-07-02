@@ -241,6 +241,7 @@ func BenchmarkFS(b *testing.B) {
 
 	// generate 100 files to be used by the bench in read mode
 	files := map[string][]byte{}
+	fileList := []string{}
 	rng := rand.New(rand.NewSource(28021976))
 	for i := 0; i < 2000; i++ {
 		var newFile string
@@ -253,11 +254,32 @@ func BenchmarkFS(b *testing.B) {
 		buf := make([]byte, rng.Int()%8192+1)
 		rng.Read(buf)
 		files[newFile] = buf
-		require.NoError(b, sqliteFS.UpsertFile(newFile, 8192, buf))
+		fileList = append(fileList, newFile)
 		require.NoError(b, os.MkdirAll(path.Join(dirfsRoot, path.Dir(newFile)), 0755))
 		require.NoError(b, os.WriteFile(path.Join(dirfsRoot, newFile), buf, 0644))
 	}
+	require.NoError(b, sqliteFS.UpsertFiles(files, 8192))
 	b.ResetTimer()
+
+	b.Run("sqliteFS open close", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, fname := range fileList {
+				f, err := sqliteFS.Open(fname)
+				require.NoError(b, err)
+				f.Close()
+			}
+		}
+	})
+
+	b.Run("dirFS open close", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, fname := range fileList {
+				f, err := dirFS.Open(fname)
+				require.NoError(b, err)
+				f.Close()
+			}
+		}
+	})
 
 	b.Run("sqliteFS", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
