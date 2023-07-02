@@ -154,10 +154,10 @@ func (f *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
 }
 
 func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
-	if path.IsAbs(fname) {
-		return fmt.Errorf("%w: %s", InvalidPathErr, fname)
-	}
-	fname = path.Clean(fname)
+	return fs.UpsertFiles(map[string][]byte{fname: data}, chunkSize)
+}
+
+func (fs *FS) UpsertFiles(files map[string][]byte, chunkSize int) (ret error) {
 
 	tx, err := fs.db.Beginx()
 	if err != nil {
@@ -171,28 +171,35 @@ func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
 		}
 	}()
 
-	inode, err := fs.addRegularFileNode(tx, fname)
-	if err != nil {
-		return fmt.Errorf("cannot insert file node: %w", err)
-	}
+	for fname, data := range files {
+		if path.IsAbs(fname) {
+			return fmt.Errorf("%w: %s", InvalidPathErr, fname)
+		}
+		fname = path.Clean(fname)
 
-	if _, err := tx.Exec(`DELETE FROM github_dgsb_dbfs_chunks WHERE inode = ?`, inode); err != nil {
-		return fmt.Errorf("cannot delete previous chunks of the same file %s: %w", fname, err)
-	}
+		inode, err := fs.addRegularFileNode(tx, fname)
+		if err != nil {
+			return fmt.Errorf("cannot insert file node: %w", err)
+		}
 
-	for i, position := 0, 0; i < len(data); i, position = i+chunkSize, position+1 {
-		toWrite := func() int {
-			remaining := len(data) - i
-			if remaining < chunkSize {
-				return remaining
-			}
-			return chunkSize
-		}()
-		_, err := tx.Exec(`
+		if _, err := tx.Exec(`DELETE FROM github_dgsb_dbfs_chunks WHERE inode = ?`, inode); err != nil {
+			return fmt.Errorf("cannot delete previous chunks of the same file %s: %w", fname, err)
+		}
+
+		for i, position := 0, 0; i < len(data); i, position = i+chunkSize, position+1 {
+			toWrite := func() int {
+				remaining := len(data) - i
+				if remaining < chunkSize {
+					return remaining
+				}
+				return chunkSize
+			}()
+			_, err := tx.Exec(`
 			INSERT INTO github_dgsb_dbfs_chunks (inode, position, data, size)
 			VALUES (?, ?, ?, ?)`, inode, position, data[i:i+toWrite], toWrite)
-		if err != nil {
-			return fmt.Errorf("cannot insert file chunk in database: %w", err)
+			if err != nil {
+				return fmt.Errorf("cannot insert file chunk in database: %w", err)
+			}
 		}
 	}
 	return nil
