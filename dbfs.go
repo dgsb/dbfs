@@ -1,4 +1,8 @@
 // Package dbfs implement the fs.FS over a sqlite3 database backend.
+// This is mostly a write once read many file system.
+// This package has an upsert file like function but fs.FS
+// interface only provides an Open method.
+// So the implementation does not expect to have concurrent read and update.
 package dbfs
 
 import (
@@ -36,6 +40,9 @@ const (
 	RegularFileType = "f"
 )
 
+// NewSqliteFS creates a new sqlite based file system
+// The dbName parameter is the database file to open.
+// If it does not exist yet it will be created and the schema migration will be run.
 func NewSqliteFS(dbName string) (*FS, error) {
 	db, err := sqlx.Open("sqlite3", dbName)
 	if err != nil {
@@ -153,10 +160,16 @@ func (f *FS) addRegularFileNode(tx *sqlx.Tx, fname string) (int, error) {
 	return parentInode, nil
 }
 
+// UpsertFile inserts or updates a file with the data content given as parameter.
+// The file data will be split in chunkSize.
+// Files in the database can have different chunk sizes.
 func (fs *FS) UpsertFile(fname string, chunkSize int, data []byte) (ret error) {
 	return fs.UpsertFiles(map[string][]byte{fname: data}, chunkSize)
 }
 
+// UpsertFiles inserts or updates many files atomically.
+// The files parameter is map whose string is the name of the file to upsert
+// and the []byte value is the data to be associated with this file.
 func (fs *FS) UpsertFiles(files map[string][]byte, chunkSize int) (ret error) {
 
 	tx, err := fs.db.Beginx()
