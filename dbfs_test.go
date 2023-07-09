@@ -232,14 +232,60 @@ func TestQuick(t *testing.T) {
 	})
 }
 
-func BenchmarkFS(b *testing.B) {
+func generateData(b *testing.B) ([]string, map[string][]byte) {
+	files := map[string][]byte{}
+	fileList := []string{}
+	rng := rand.New(rand.NewSource(28021976))
+	for i := 0; i < 2000; i++ {
+		var newFile string
+		for {
+			newFile = generatePath(rng)
+			if _, ok := files[newFile]; !ok { // ensure all generated path are unique
+				break
+			}
+		}
+		buf := make([]byte, rng.Int()%8192+1)
+		rng.Read(buf)
+		files[newFile] = buf
+		fileList = append(fileList, newFile)
+	}
+	return fileList, files
+}
+
+func BenchmarkSqliteFS(b *testing.B) {
 	sqliteFS, err := NewSqliteFS(path.Join(b.TempDir(), "fsbench.db"))
 	require.NoError(b, err)
+
+	fileList, files := generateDate(b)
+	require.NoError(b, sqliteFS.UpsertFiles(files, 8192))
+	b.ResetTimer()
+
+	b.Run("sqliteFS open close", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for _, fname := range fileList {
+				f, err := sqliteFS.Open(fname)
+				require.NoError(b, err)
+				f.Close()
+			}
+		}
+	})
+
+	b.Run("sqliteFS", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for k, v := range files {
+				data, err := fs.ReadFile(sqliteFS, k)
+				require.NoError(b, err, "cannot read file %s", k)
+				require.Equal(b, v, data)
+			}
+		}
+	})
+}
+
+func BenchmarkFS(b *testing.B) {
 	dirfsRoot := path.Join(b.TempDir(), "dirfsbenc")
 	require.NoError(b, os.MkdirAll(dirfsRoot, 0755))
 	dirFS := os.DirFS(dirfsRoot)
 
-	// generate 100 files to be used by the bench in read mode
 	files := map[string][]byte{}
 	fileList := []string{}
 	rng := rand.New(rand.NewSource(28021976))
@@ -261,32 +307,12 @@ func BenchmarkFS(b *testing.B) {
 	require.NoError(b, sqliteFS.UpsertFiles(files, 8192))
 	b.ResetTimer()
 
-	b.Run("sqliteFS open close", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			for _, fname := range fileList {
-				f, err := sqliteFS.Open(fname)
-				require.NoError(b, err)
-				f.Close()
-			}
-		}
-	})
-
 	b.Run("dirFS open close", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			for _, fname := range fileList {
 				f, err := dirFS.Open(fname)
 				require.NoError(b, err)
 				f.Close()
-			}
-		}
-	})
-
-	b.Run("sqliteFS", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			for k, v := range files {
-				data, err := fs.ReadFile(sqliteFS, k)
-				require.NoError(b, err, "cannot read file %s", k)
-				require.Equal(b, v, data)
 			}
 		}
 	})
