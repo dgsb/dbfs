@@ -256,7 +256,7 @@ func BenchmarkSqliteFS(b *testing.B) {
 	sqliteFS, err := NewSqliteFS(path.Join(b.TempDir(), "fsbench.db"))
 	require.NoError(b, err)
 
-	fileList, files := generateDate(b)
+	fileList, files := generateData(b)
 	require.NoError(b, sqliteFS.UpsertFiles(files, 8192))
 	b.ResetTimer()
 
@@ -304,7 +304,6 @@ func BenchmarkFS(b *testing.B) {
 		require.NoError(b, os.MkdirAll(path.Join(dirfsRoot, path.Dir(newFile)), 0755))
 		require.NoError(b, os.WriteFile(path.Join(dirfsRoot, newFile), buf, 0644))
 	}
-	require.NoError(b, sqliteFS.UpsertFiles(files, 8192))
 	b.ResetTimer()
 
 	b.Run("dirFS open close", func(b *testing.B) {
